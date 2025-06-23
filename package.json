@@ -7,7 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "scratchcloud": "^1.3.2",
+    "scratchcloud": "^1.3.0",
     "ws": "^8.15.1"
   }
 }
