@@ -1,0 +1,13 @@
+{
+  "name": "scratch-cloud-server",
+  "version": "1.0.0",
+  "description": "Server for managing Scratch cloud variables",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "scratchcloud": "^1.3.2",
+    "ws": "^8.15.1"
+  }
+}
