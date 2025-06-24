@@ -45,6 +45,8 @@ let clients = [];
             // 全クラウド変数を返す
             const vars = cloud.vars; 
             ws.send(JSON.stringify({ type: "all", vars }));
+          } else if (data.type === "ping") {
+            ws.send(JSON.stringify({ type: "pong" }));
           }
         } catch (e) {
           console.error("⚠️ 無効なメッセージ", e);
