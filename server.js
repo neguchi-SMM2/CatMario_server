@@ -54,13 +54,27 @@ function connectToTurboWarpCloud() {
 
   turboSocket.on("message", msg => {
     try {
-      const data = JSON.parse(msg);
+      // Bufferを文字列に変換してからJSONを解析
+      let msgString;
+      if (Buffer.isBuffer(msg)) {
+        msgString = msg.toString('utf8');
+      } else {
+        msgString = msg;
+      }
+      
+      const data = JSON.parse(msgString);
       if (data.method === "set") {
         turboVars[data.name] = data.value;
         broadcast("turbowarp", { type: "update", name: data.name, value: data.value });
       }
     } catch (err) {
-      console.error("⚠️ TurboWarp メッセージ解析失敗:", msg);
+      console.error("⚠️ TurboWarp メッセージ解析失敗:", err);
+      // デバッグ用：実際のメッセージ内容を表示
+      if (Buffer.isBuffer(msg)) {
+        console.log("Buffer内容:", msg.toString('utf8'));
+      } else {
+        console.log("メッセージ内容:", msg);
+      }
     }
   });
 
