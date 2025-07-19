@@ -20,6 +20,7 @@ let turboVars = {};
 // Scratch Cloud に接続
 async function connectToScratchCloud() {
   try {
+    console.log("🔄 Scratch Cloud 接続試行中...");
     const session = await Session.createAsync(USERNAME, PASSWORD);
     scratchCloud = await Cloud.createAsync(session, PROJECT_ID);
     scratchVars = { ...scratchCloud.vars };
@@ -29,9 +30,25 @@ async function connectToScratchCloud() {
       scratchVars[name] = value;
       broadcast("scratch", { type: "update", name, value });
     });
+
+    // 接続が切断された場合の再接続処理
+    scratchCloud.on("close", () => {
+      console.warn("⚠️ Scratch Cloud 接続切断 → 再接続");
+      scratchCloud = null;
+      setTimeout(connectToScratchCloud, 5000);
+    });
+
+    scratchCloud.on("error", (err) => {
+      console.error("❌ Scratch Cloud エラー:", err);
+      scratchCloud = null;
+      setTimeout(connectToScratchCloud, 5000);
+    });
+
   } catch (err) {
-    console.error("❌ Scratch Cloud 接続失敗:", err);
-    process.exit(1);
+    console.error("❌ Scratch Cloud 接続失敗:", err.message);
+    console.log("⚠️ Scratch Cloudなしでサーバーを継続します");
+    scratchCloud = null;
+    // process.exit(1) を削除してサーバーを継続
   }
 }
 
@@ -113,18 +130,26 @@ function broadcast(mode, message) {
 
 // クラウド変数の書き込み
 async function setCloudVar(mode, name, value) {
-  if (mode === "scratch" && scratchCloud) {
-    await scratchCloud.set(name, String(value));
-  } else if (mode === "turbowarp" && turboSocket?.readyState === WebSocket.OPEN) {
-    turboSocket.send(JSON.stringify({
-      method: "set",
-      name,
-      value: String(value),
-      user: "server-bot",
-      project_id: PROJECT_ID
-    }));
-  } else {
-    throw new Error("無効な mode またはクラウド接続エラー");
+  try {
+    if (mode === "scratch" && scratchCloud) {
+      await scratchCloud.set(name, String(value));
+    } else if (mode === "scratch" && !scratchCloud) {
+      console.warn("⚠️ Scratch Cloud 未接続のため書き込みをスキップ");
+      throw new Error("Scratch Cloud 未接続");
+    } else if (mode === "turbowarp" && turboSocket?.readyState === WebSocket.OPEN) {
+      turboSocket.send(JSON.stringify({
+        method: "set",
+        name,
+        value: String(value),
+        user: "server-bot",
+        project_id: PROJECT_ID
+      }));
+    } else {
+      throw new Error("無効な mode またはクラウド接続エラー");
+    }
+  } catch (err) {
+    console.error(`❌ ${mode} クラウド変数書き込みエラー:`, err.message);
+    throw err; // エラーを再スローしてクライアントに通知
   }
 }
 
@@ -153,7 +178,12 @@ wss.on("connection", ws => {
       }
 
       if (data.type === "set" && data.name && data.value !== undefined) {
-        await setCloudVar(mode, data.name, data.value);
+        try {
+          await setCloudVar(mode, data.name, data.value);
+          ws.send(JSON.stringify({ type: "success", message: "変数設定完了" }));
+        } catch (setErr) {
+          ws.send(JSON.stringify({ type: "error", message: `変数設定失敗: ${setErr.message}` }));
+        }
       } else if (data.type === "get") {
         const vars = mode === "scratch" ? scratchVars : turboVars;
         ws.send(JSON.stringify({ type: "all", mode, vars }));
@@ -173,5 +203,9 @@ wss.on("connection", ws => {
 });
 
 // サーバー起動
+console.log("🚀 サーバー起動中...");
 connectToScratchCloud();
 connectToTurboWarpCloud();
+
+console.log(`📡 WebSocketサーバーがポート ${PORT} で待機中`);
+console.log("🔌 クライアント接続を待機しています...");
