@@ -54,7 +54,7 @@ function connectToTurboWarpCloud() {
 
   turboSocket.on("message", msg => {
     try {
-      // Bufferを文字列に変換してからJSONを解析
+      // Bufferを文字列に変換
       let msgString;
       if (Buffer.isBuffer(msg)) {
         msgString = msg.toString('utf8');
@@ -62,13 +62,26 @@ function connectToTurboWarpCloud() {
         msgString = msg;
       }
       
-      const data = JSON.parse(msgString);
-      if (data.method === "set") {
-        turboVars[data.name] = data.value;
-        broadcast("turbowarp", { type: "update", name: data.name, value: data.value });
-      }
+      // 複数のJSONメッセージが連結されている場合を処理
+      // 改行で分割して各JSONを個別に処理
+      const messages = msgString.trim().split('\n').filter(line => line.trim());
+      
+      messages.forEach(message => {
+        try {
+          const data = JSON.parse(message);
+          if (data.method === "set") {
+            turboVars[data.name] = data.value;
+            broadcast("turbowarp", { type: "update", name: data.name, value: data.value });
+          }
+        } catch (parseErr) {
+          // 単一のJSONメッセージ解析失敗
+          console.error("⚠️ 個別JSON解析失敗:", parseErr.message);
+          console.log("問題のあるメッセージ:", message);
+        }
+      });
+      
     } catch (err) {
-      console.error("⚠️ TurboWarp メッセージ解析失敗:", err);
+      console.error("⚠️ TurboWarp メッセージ処理失敗:", err);
       // デバッグ用：実際のメッセージ内容を表示
       if (Buffer.isBuffer(msg)) {
         console.log("Buffer内容:", msg.toString('utf8'));
