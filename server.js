@@ -9,15 +9,15 @@ const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 let clients = [];
 
-// Scratch用
+// Scratch 用クラウド変数管理
 let scratchCloud = null;
 let scratchVars = {};
 
-// TurboWarp用
+// TurboWarp 用クラウド変数管理
 let turboSocket = null;
 let turboVars = {};
 
-// Scratch接続
+// Scratch Cloud に接続
 async function connectToScratchCloud() {
   try {
     const session = await Session.createAsync(USERNAME, PASSWORD);
@@ -29,15 +29,19 @@ async function connectToScratchCloud() {
       scratchVars[name] = value;
       broadcast("scratch", { type: "update", name, value });
     });
-  } catch (e) {
-    console.error("❌ Scratch接続失敗:", e);
+  } catch (err) {
+    console.error("❌ Scratch Cloud 接続失敗:", err);
     process.exit(1);
   }
 }
 
-// TurboWarp接続
+// TurboWarp Cloud に接続
 function connectToTurboWarpCloud() {
-  turboSocket = new WebSocket("wss://clouddata.turbowarp.org");
+  turboSocket = new WebSocket("wss://clouddata.turbowarp.org", {
+    headers: {
+      "User-Agent": "CatMario_server/1.0 (https://github.com/neguchi-SMM2/CatMario_server)"
+    }
+  });
 
   turboSocket.on("open", () => {
     turboSocket.send(JSON.stringify({
@@ -49,10 +53,14 @@ function connectToTurboWarpCloud() {
   });
 
   turboSocket.on("message", msg => {
-    const data = JSON.parse(msg);
-    if (data.method === "set") {
-      turboVars[data.name] = data.value;
-      broadcast("turbowarp", { type: "update", name: data.name, value: data.value });
+    try {
+      const data = JSON.parse(msg);
+      if (data.method === "set") {
+        turboVars[data.name] = data.value;
+        broadcast("turbowarp", { type: "update", name: data.name, value: data.value });
+      }
+    } catch (err) {
+      console.error("⚠️ TurboWarp メッセージ解析失敗:", msg);
     }
   });
 
@@ -62,21 +70,21 @@ function connectToTurboWarpCloud() {
   });
 
   turboSocket.on("error", err => {
-    console.error("❌ TurboWarpエラー:", err);
+    console.error("❌ TurboWarp エラー:", err);
   });
 }
 
-// クライアントにモード別に送信
+// クライアント全体に通知
 function broadcast(mode, message) {
   const msg = JSON.stringify(message);
   clients.forEach(ws => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg); // 全クライアントに送信
+      ws.send(msg); // 全クライアントに送信（必要に応じて mode フィルタ可能）
     }
   });
 }
 
-// モードごとのクラウド変数操作
+// クラウド変数の書き込み
 async function setCloudVar(mode, name, value) {
   if (mode === "scratch" && scratchCloud) {
     await scratchCloud.set(name, String(value));
@@ -89,14 +97,18 @@ async function setCloudVar(mode, name, value) {
       project_id: PROJECT_ID
     }));
   } else {
-    throw new Error("無効な mode またはクラウド未接続");
+    throw new Error("無効な mode またはクラウド接続エラー");
   }
 }
 
-// WebSocket処理
+// WebSocket 接続処理
 wss.on("connection", ws => {
   console.log("🔌 クライアント接続");
   clients.push(ws);
+
+  // ✅ 初期クラウド変数送信
+  ws.send(JSON.stringify({ type: "all", mode: "scratch", vars: scratchVars }));
+  ws.send(JSON.stringify({ type: "all", mode: "turbowarp", vars: turboVars }));
 
   ws.on("message", async msg => {
     try {
@@ -109,7 +121,7 @@ wss.on("connection", ws => {
       }
 
       if (!["scratch", "turbowarp"].includes(mode)) {
-        ws.send(JSON.stringify({ type: "error", message: "modeを指定してください（scratchまたはturbowarp）" }));
+        ws.send(JSON.stringify({ type: "error", message: "modeを'scratch'または'turbowarp'に指定してください" }));
         return;
       }
 
@@ -119,11 +131,11 @@ wss.on("connection", ws => {
         const vars = mode === "scratch" ? scratchVars : turboVars;
         ws.send(JSON.stringify({ type: "all", mode, vars }));
       } else {
-        ws.send(JSON.stringify({ type: "error", message: "不明なtypeです" }));
+        ws.send(JSON.stringify({ type: "error", message: "不明な type です" }));
       }
-    } catch (e) {
-      console.error("⚠️ メッセージエラー:", e);
-      ws.send(JSON.stringify({ type: "error", message: "メッセージ形式が無効です" }));
+    } catch (err) {
+      console.error("⚠️ メッセージ処理エラー:", err);
+      ws.send(JSON.stringify({ type: "error", message: "JSON パースエラーまたは形式不正" }));
     }
   });
 
@@ -133,6 +145,6 @@ wss.on("connection", ws => {
   });
 });
 
-// 起動
+// サーバー起動
 connectToScratchCloud();
 connectToTurboWarpCloud();
