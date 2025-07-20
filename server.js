@@ -28,7 +28,8 @@ async function connectToScratchCloud() {
 
     scratchCloud.on("set", (name, value) => {
       scratchVars[name] = value;
-      broadcast("scratch", { type: "update", name, value });
+      // 🔧 修正：modeを含めて送信
+      broadcast("scratch", { type: "update", mode: "scratch", name, value });
     });
 
     // 接続が切断された場合の再接続処理
@@ -88,7 +89,8 @@ function connectToTurboWarpCloud() {
           const data = JSON.parse(message);
           if (data.method === "set") {
             turboVars[data.name] = data.value;
-            broadcast("turbowarp", { type: "update", name: data.name, value: data.value });
+            // 🔧 修正：modeを含めて送信
+            broadcast("turbowarp", { type: "update", mode: "turbowarp", name: data.name, value: data.value });
           }
         } catch (parseErr) {
           // 単一のJSONメッセージ解析失敗
@@ -118,12 +120,12 @@ function connectToTurboWarpCloud() {
   });
 }
 
-// クライアント全体に通知
+// 🔧 修正：クライアント全体に通知（modeは参考情報として残すが、メッセージ自体に含める）
 function broadcast(mode, message) {
   const msg = JSON.stringify(message);
   clients.forEach(ws => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg); // 全クライアントに送信（必要に応じて mode フィルタ可能）
+      ws.send(msg);
     }
   });
 }
