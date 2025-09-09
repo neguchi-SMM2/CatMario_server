@@ -6,208 +6,353 @@ const PASSWORD = process.env.SCRATCH_PASSWORD;
 const PROJECT_ID = parseInt(process.env.SCRATCH_PROJECT_ID, 10);
 const PORT = process.env.PORT || 3000;
 
-const wss = new WebSocket.Server({ port: PORT });
-let clients = [];
-
-// Scratch 用クラウド変数管理
-let scratchCloud = null;
-let scratchVars = {};
-
-// TurboWarp 用クラウド変数管理
-let turboSocket = null;
-let turboVars = {};
-
-// Scratch Cloud に接続
-async function connectToScratchCloud() {
-  try {
-    console.log("🔄 Scratch Cloud 接続試行中...");
-    const session = await Session.createAsync(USERNAME, PASSWORD);
-    scratchCloud = await Cloud.createAsync(session, PROJECT_ID);
-    scratchVars = { ...scratchCloud.vars };
-    console.log("✅ Scratch Cloud 接続成功");
-
-    scratchCloud.on("set", (name, value) => {
-      scratchVars[name] = value;
-      // 🔧 修正：modeを含めて送信
-      broadcast("scratch", { type: "update", mode: "scratch", name, value });
-    });
-
-    // 接続が切断された場合の再接続処理
-    scratchCloud.on("close", () => {
-      console.warn("⚠️ Scratch Cloud 接続切断 → 再接続");
-      scratchCloud = null;
-      setTimeout(connectToScratchCloud, 5000);
-    });
-
-    scratchCloud.on("error", (err) => {
-      console.error("❌ Scratch Cloud エラー:", err);
-      scratchCloud = null;
-      setTimeout(connectToScratchCloud, 5000);
-    });
-
-  } catch (err) {
-    console.error("❌ Scratch Cloud 接続失敗:", err.message);
-    console.log("⚠️ Scratch Cloudなしでサーバーを継続します");
-    scratchCloud = null;
-    // process.exit(1) を削除してサーバーを継続
+class CloudManager {
+  constructor() {
+    this.wss = new WebSocket.Server({ port: PORT });
+    this.clients = new Set(); // Array → Set に変更（削除が O(1)）
+    
+    // 統合されたクラウド変数管理
+    this.cloudData = {
+      scratch: { connection: null, vars: {}, reconnectDelay: 5000 },
+      turbowarp: { connection: null, vars: {}, reconnectDelay: 2000 }
+    };
+    
+    this.messageQueue = new Map(); // バッチ処理用
+    this.batchTimeout = null;
   }
-}
 
-// TurboWarp Cloud に接続
-function connectToTurboWarpCloud() {
-  turboSocket = new WebSocket("wss://clouddata.turbowarp.org", {
-    headers: {
-      "User-Agent": "CatMario_server/1.0 (https://github.com/neguchi-SMM2/CatMario_server)"
+  // 🚀 バッチブロードキャスト（複数の変更を一度に送信）
+  scheduleBroadcast(mode, name, value) {
+    const key = mode;
+    if (!this.messageQueue.has(key)) {
+      this.messageQueue.set(key, { type: "batch_update", mode, updates: {} });
     }
-  });
+    this.messageQueue.get(key).updates[name] = value;
+    
+    // 50ms 以内の変更をまとめて送信
+    clearTimeout(this.batchTimeout);
+    this.batchTimeout = setTimeout(() => this.flushBroadcasts(), 50);
+  }
 
-  turboSocket.on("open", () => {
-    turboSocket.send(JSON.stringify({
-      method: "handshake",
-      user: "server-bot",
-      project_id: PROJECT_ID
-    }));
-    console.log("✅ TurboWarp Cloud 接続成功");
-  });
+  flushBroadcasts() {
+    for (const [mode, message] of this.messageQueue) {
+      this.broadcast(JSON.stringify(message));
+    }
+    this.messageQueue.clear();
+  }
 
-  turboSocket.on("message", msg => {
-    try {
-      // Bufferを文字列に変換
-      let msgString;
-      if (Buffer.isBuffer(msg)) {
-        msgString = msg.toString('utf8');
-      } else {
-        msgString = msg;
-      }
-      
-      // 複数のJSONメッセージが連結されている場合を処理
-      // 改行で分割して各JSONを個別に処理
-      const messages = msgString.trim().split('\n').filter(line => line.trim());
-      
-      messages.forEach(message => {
+  // 🚀 効率化されたブロードキャスト
+  broadcast(message) {
+    if (this.clients.size === 0) return; // 早期リターン
+    
+    const deadClients = new Set();
+    
+    for (const ws of this.clients) {
+      if (ws.readyState === WebSocket.OPEN) {
         try {
-          const data = JSON.parse(message);
-          if (data.method === "set") {
-            turboVars[data.name] = data.value;
-            // 🔧 修正：modeを含めて送信
-            broadcast("turbowarp", { type: "update", mode: "turbowarp", name: data.name, value: data.value });
-          }
-        } catch (parseErr) {
-          // 単一のJSONメッセージ解析失敗
-          console.error("⚠️ 個別JSON解析失敗:", parseErr.message);
-          console.log("問題のあるメッセージ:", message);
+          ws.send(message);
+        } catch (err) {
+          console.warn("⚠️ 送信失敗:", err.message);
+          deadClients.add(ws);
         }
-      });
-      
-    } catch (err) {
-      console.error("⚠️ TurboWarp メッセージ処理失敗:", err);
-      // デバッグ用：実際のメッセージ内容を表示
-      if (Buffer.isBuffer(msg)) {
-        console.log("Buffer内容:", msg.toString('utf8'));
       } else {
-        console.log("メッセージ内容:", msg);
+        deadClients.add(ws);
       }
     }
-  });
-
-  turboSocket.on("close", () => {
-    console.warn("⚠️ TurboWarp 接続切断 → 再接続");
-    setTimeout(connectToTurboWarpCloud, 2000);
-  });
-
-  turboSocket.on("error", err => {
-    console.error("❌ TurboWarp エラー:", err);
-  });
-}
-
-// 🔧 修正：クライアント全体に通知（modeは参考情報として残すが、メッセージ自体に含める）
-function broadcast(mode, message) {
-  const msg = JSON.stringify(message);
-  clients.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
+    
+    // 無効なクライアントを一括削除
+    for (const deadClient of deadClients) {
+      this.clients.delete(deadClient);
     }
-  });
-}
+  }
 
-// クラウド変数の書き込み
-async function setCloudVar(mode, name, value) {
-  try {
-    if (mode === "scratch" && scratchCloud) {
-      await scratchCloud.set(name, String(value));
-    } else if (mode === "scratch" && !scratchCloud) {
-      console.warn("⚠️ Scratch Cloud 未接続のため書き込みをスキップ");
-      throw new Error("Scratch Cloud 未接続");
-    } else if (mode === "turbowarp" && turboSocket?.readyState === WebSocket.OPEN) {
-      turboSocket.send(JSON.stringify({
+  // 🚀 Scratch Cloud 接続（エラーハンドリング改善）
+  async connectToScratchCloud() {
+    if (this.cloudData.scratch.connection) return; // 既に接続中の場合は何もしない
+    
+    try {
+      console.log("🔄 Scratch Cloud 接続試行中...");
+      const session = await Session.createAsync(USERNAME, PASSWORD);
+      const cloud = await Cloud.createAsync(session, PROJECT_ID);
+      
+      this.cloudData.scratch.connection = cloud;
+      this.cloudData.scratch.vars = { ...cloud.vars };
+      console.log("✅ Scratch Cloud 接続成功");
+
+      cloud.on("set", (name, value) => {
+        this.cloudData.scratch.vars[name] = value;
+        this.scheduleBroadcast("scratch", name, value);
+      });
+
+      // 🚀 指数バックオフによる再接続
+      cloud.on("close", () => {
+        console.warn("⚠️ Scratch Cloud 接続切断");
+        this.cloudData.scratch.connection = null;
+        this.scheduleReconnect("scratch");
+      });
+
+      cloud.on("error", (err) => {
+        console.error("❌ Scratch Cloud エラー:", err.message);
+        this.cloudData.scratch.connection = null;
+        this.scheduleReconnect("scratch");
+      });
+
+    } catch (err) {
+      console.error("❌ Scratch Cloud 接続失敗:", err.message);
+      console.log("⚠️ Scratch Cloudなしでサーバーを継続します");
+      this.cloudData.scratch.connection = null;
+    }
+  }
+
+  // 🚀 TurboWarp Cloud 接続（メッセージ処理効率化）
+  connectToTurboWarpCloud() {
+    if (this.cloudData.turbowarp.connection?.readyState === WebSocket.OPEN) return;
+    
+    const socket = new WebSocket("wss://clouddata.turbowarp.org", {
+      headers: {
+        "User-Agent": "CatMario_server/1.0 (https://github.com/neguchi-SMM2/CatMario_server)"
+      }
+    });
+
+    socket.on("open", () => {
+      socket.send(JSON.stringify({
+        method: "handshake",
+        user: "server-bot",
+        project_id: PROJECT_ID
+      }));
+      console.log("✅ TurboWarp Cloud 接続成功");
+      this.cloudData.turbowarp.connection = socket;
+    });
+
+    // 🚀 効率化されたメッセージ処理
+    socket.on("message", msg => {
+      try {
+        const msgString = Buffer.isBuffer(msg) ? msg.toString('utf8') : msg;
+        const messages = msgString.trim().split('\n').filter(Boolean);
+        
+        const updates = {};
+        let hasUpdates = false;
+        
+        for (const message of messages) {
+          try {
+            const data = JSON.parse(message);
+            if (data.method === "set") {
+              this.cloudData.turbowarp.vars[data.name] = data.value;
+              updates[data.name] = data.value;
+              hasUpdates = true;
+            }
+          } catch (parseErr) {
+            console.error("⚠️ JSON解析失敗:", parseErr.message);
+          }
+        }
+        
+        // 複数の更新を一度にブロードキャスト
+        if (hasUpdates) {
+          this.broadcast(JSON.stringify({
+            type: "batch_update",
+            mode: "turbowarp",
+            updates
+          }));
+        }
+        
+      } catch (err) {
+        console.error("⚠️ TurboWarp メッセージ処理失敗:", err.message);
+      }
+    });
+
+    socket.on("close", () => {
+      console.warn("⚠️ TurboWarp 接続切断");
+      this.cloudData.turbowarp.connection = null;
+      this.scheduleReconnect("turbowarp");
+    });
+
+    socket.on("error", err => {
+      console.error("❌ TurboWarp エラー:", err.message);
+      this.cloudData.turbowarp.connection = null;
+    });
+  }
+
+  // 🚀 指数バックオフによる再接続スケジューリング
+  scheduleReconnect(mode) {
+    const data = this.cloudData[mode];
+    const delay = Math.min(data.reconnectDelay, 30000); // 最大30秒
+    
+    console.log(`⏰ ${mode} 再接続を ${delay}ms 後に実行`);
+    setTimeout(() => {
+      if (mode === "scratch") {
+        this.connectToScratchCloud();
+      } else {
+        this.connectToTurboWarpCloud();
+      }
+      // 再接続遅延を増加（指数バックオフ）
+      data.reconnectDelay = Math.min(data.reconnectDelay * 1.5, 30000);
+    }, delay);
+  }
+
+  // 🚀 効率化されたクラウド変数書き込み
+  async setCloudVar(mode, name, value) {
+    const data = this.cloudData[mode];
+    const strValue = String(value);
+    
+    if (mode === "scratch") {
+      if (!data.connection) {
+        throw new Error("Scratch Cloud 未接続");
+      }
+      await data.connection.set(name, strValue);
+    } else if (mode === "turbowarp") {
+      const socket = data.connection;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        throw new Error("TurboWarp Cloud 未接続");
+      }
+      socket.send(JSON.stringify({
         method: "set",
         name,
-        value: String(value),
+        value: strValue,
         user: "server-bot",
         project_id: PROJECT_ID
       }));
     } else {
-      throw new Error("無効な mode またはクラウド接続エラー");
+      throw new Error(`無効なmode: ${mode}`);
     }
-  } catch (err) {
-    console.error(`❌ ${mode} クラウド変数書き込みエラー:`, err.message);
-    throw err; // エラーを再スローしてクライアントに通知
+  }
+
+  // 🚀 プリコンパイル済み応答パターン
+  static responses = {
+    invalidMode: JSON.stringify({ type: "error", message: "modeを'scratch'または'turbowarp'に指定してください" }),
+    success: JSON.stringify({ type: "success", message: "変数設定完了" }),
+    unknownType: JSON.stringify({ type: "error", message: "不明な type です" }),
+    parseError: JSON.stringify({ type: "error", message: "JSON パースエラーまたは形式不正" }),
+    pong: JSON.stringify({ type: "pong" })
+  };
+
+  // WebSocket クライアント処理
+  handleConnection(ws) {
+    console.log("🔌 クライアント接続");
+    this.clients.add(ws);
+
+    // 初期データ送信
+    const initData = {
+      scratch: { type: "all", mode: "scratch", vars: this.cloudData.scratch.vars },
+      turbowarp: { type: "all", mode: "turbowarp", vars: this.cloudData.turbowarp.vars }
+    };
+    
+    ws.send(JSON.stringify(initData.scratch));
+    ws.send(JSON.stringify(initData.turbowarp));
+
+    ws.on("message", async msg => {
+      try {
+        const data = JSON.parse(msg);
+        
+        // 🚀 ping処理を最優先
+        if (data.type === "ping") {
+          ws.send(CloudManager.responses.pong);
+          return;
+        }
+
+        const { mode, type, name, value } = data;
+
+        if (!["scratch", "turbowarp"].includes(mode)) {
+          ws.send(CloudManager.responses.invalidMode);
+          return;
+        }
+
+        switch (type) {
+          case "set":
+            if (name && value !== undefined) {
+              try {
+                await this.setCloudVar(mode, name, value);
+                ws.send(CloudManager.responses.success);
+              } catch (err) {
+                ws.send(JSON.stringify({ 
+                  type: "error", 
+                  message: `変数設定失敗: ${err.message}` 
+                }));
+              }
+            } else {
+              ws.send(JSON.stringify({ 
+                type: "error", 
+                message: "name と value は必須です" 
+              }));
+            }
+            break;
+
+          case "get":
+            ws.send(JSON.stringify({ 
+              type: "all", 
+              mode, 
+              vars: this.cloudData[mode].vars 
+            }));
+            break;
+
+          default:
+            ws.send(CloudManager.responses.unknownType);
+        }
+      } catch (err) {
+        console.error("⚠️ メッセージ処理エラー:", err);
+        ws.send(CloudManager.responses.parseError);
+      }
+    });
+
+    ws.on("close", () => {
+      this.clients.delete(ws);
+      console.log("❌ クライアント切断");
+    });
+
+    // 🚀 エラーハンドリング追加
+    ws.on("error", (err) => {
+      console.error("❌ WebSocket クライアントエラー:", err.message);
+      this.clients.delete(ws);
+    });
+  }
+
+  // サーバー開始
+  async start() {
+    console.log("🚀 サーバー起動中...");
+    
+    this.wss.on("connection", ws => this.handleConnection(ws));
+    
+    // 並行接続で起動時間短縮
+    await Promise.allSettled([
+      this.connectToScratchCloud(),
+      Promise.resolve(this.connectToTurboWarpCloud())
+    ]);
+
+    console.log(`📡 WebSocketサーバーがポート ${PORT} で待機中`);
+    console.log("🔌 クライアント接続を待機しています...");
+
+    // 🚀 定期的なヘルスチェック（5分間隔）
+    setInterval(() => {
+      const scratchStatus = this.cloudData.scratch.connection ? "接続" : "切断";
+      const turboStatus = this.cloudData.turbowarp.connection?.readyState === WebSocket.OPEN ? "接続" : "切断";
+      console.log(`💡 ヘルスチェック - Scratch: ${scratchStatus}, TurboWarp: ${turboStatus}, クライアント: ${this.clients.size}件`);
+    }, 300000);
+
+    // 🚀 グレースフルシャットダウン
+    process.on('SIGTERM', () => this.shutdown());
+    process.on('SIGINT', () => this.shutdown());
+  }
+
+  shutdown() {
+    console.log("🛑 サーバーシャットダウン開始...");
+    
+    // すべてのクライアントに切断通知
+    this.broadcast(JSON.stringify({ type: "server_shutdown", message: "サーバーがシャットダウンします" }));
+    
+    // 接続クローズ
+    this.cloudData.scratch.connection?.close();
+    this.cloudData.turbowarp.connection?.close();
+    this.wss.close();
+    
+    console.log("✅ シャットダウン完了");
+    process.exit(0);
   }
 }
 
-// WebSocket 接続処理
-wss.on("connection", ws => {
-  console.log("🔌 クライアント接続");
-  clients.push(ws);
-
-  // ✅ 初期クラウド変数送信
-  ws.send(JSON.stringify({ type: "all", mode: "scratch", vars: scratchVars }));
-  ws.send(JSON.stringify({ type: "all", mode: "turbowarp", vars: turboVars }));
-
-  ws.on("message", async msg => {
-    try {
-      const data = JSON.parse(msg);
-      const mode = data.mode;
-
-      if (data.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
-        return;
-      }
-
-      if (!["scratch", "turbowarp"].includes(mode)) {
-        ws.send(JSON.stringify({ type: "error", message: "modeを'scratch'または'turbowarp'に指定してください" }));
-        return;
-      }
-
-      if (data.type === "set" && data.name && data.value !== undefined) {
-        try {
-          await setCloudVar(mode, data.name, data.value);
-          ws.send(JSON.stringify({ type: "success", message: "変数設定完了" }));
-        } catch (setErr) {
-          ws.send(JSON.stringify({ type: "error", message: `変数設定失敗: ${setErr.message}` }));
-        }
-      } else if (data.type === "get") {
-        const vars = mode === "scratch" ? scratchVars : turboVars;
-        ws.send(JSON.stringify({ type: "all", mode, vars }));
-      } else {
-        ws.send(JSON.stringify({ type: "error", message: "不明な type です" }));
-      }
-    } catch (err) {
-      console.error("⚠️ メッセージ処理エラー:", err);
-      ws.send(JSON.stringify({ type: "error", message: "JSON パースエラーまたは形式不正" }));
-    }
+// 🚀 メイン実行部分をシンプル化
+if (require.main === module) {
+  const server = new CloudManager();
+  server.start().catch(err => {
+    console.error("❌ サーバー起動失敗:", err);
+    process.exit(1);
   });
-
-  ws.on("close", () => {
-    clients = clients.filter(c => c !== ws);
-    console.log("❌ クライアント切断");
-  });
-});
-
-// サーバー起動
-console.log("🚀 サーバー起動中...");
-connectToScratchCloud();
-connectToTurboWarpCloud();
-
-console.log(`📡 WebSocketサーバーがポート ${PORT} で待機中`);
-console.log("🔌 クライアント接続を待機しています...");
+}
