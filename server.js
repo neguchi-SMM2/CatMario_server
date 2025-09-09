@@ -351,6 +351,22 @@ class CloudManager {
 // 🚀 メイン実行部分をシンプル化
 if (require.main === module) {
   const server = new CloudManager();
+  
+  // 🔧 修正：未処理のエラーをキャッチ
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ 未処理のPromise拒否:', reason);
+    // サーバーは継続する（クラッシュしない）
+  });
+  
+  process.on('uncaughtException', (err) => {
+    console.error('❌ 未処理の例外:', err);
+    // 重大なエラーの場合のみ終了
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ ポート ${PORT} は既に使用されています`);
+      process.exit(1);
+    }
+  });
+  
   server.start().catch(err => {
     console.error("❌ サーバー起動失敗:", err);
     process.exit(1);
