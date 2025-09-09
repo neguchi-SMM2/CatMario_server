@@ -179,13 +179,19 @@ class CloudManager {
     
     console.log(`⏰ ${mode} 再接続を ${delay}ms 後に実行`);
     setTimeout(() => {
-      if (mode === "scratch") {
-        this.connectToScratchCloud();
-      } else {
-        this.connectToTurboWarpCloud();
+      try {
+        if (mode === "scratch") {
+          this.connectToScratchCloud().catch(err => {
+            console.warn(`⚠️ ${mode} 再接続失敗:`, err.message);
+          });
+        } else {
+          this.connectToTurboWarpCloud();
+        }
+        // 再接続遅延を増加（指数バックオフ）
+        data.reconnectDelay = Math.min(data.reconnectDelay * 1.5, 30000);
+      } catch (err) {
+        console.error(`❌ ${mode} 再接続処理エラー:`, err.message);
       }
-      // 再接続遅延を増加（指数バックオフ）
-      data.reconnectDelay = Math.min(data.reconnectDelay * 1.5, 30000);
     }, delay);
   }
 
