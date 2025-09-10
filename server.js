@@ -310,13 +310,18 @@ class CloudManager {
   scheduleLongTermReconnect(mode) {
     const data = this.cloudData[mode];
     
+    // 既存のタイマーをクリア
     if (data.reconnectTimer) {
       clearTimeout(data.reconnectTimer);
+      data.reconnectTimer = null;
     }
     
     console.log(`⏰ ${mode} 長期再接続を900秒後に実行`);
     
     data.reconnectTimer = setTimeout(async () => {
+      // 再接続処理中はタイマーをクリア
+      data.reconnectTimer = null;
+      
       console.log(`🔄 ${mode} 900秒後の再接続を開始...`);
       try {
         let success = false;
@@ -330,11 +335,14 @@ class CloudManager {
           // 再接続失敗時は再度900秒後に試行
           console.log(`❌ ${mode} 再接続失敗 - 次回は900秒後`);
           this.scheduleLongTermReconnect(mode);
+        } else {
+          console.log(`✅ ${mode} 再接続成功`);
         }
       } catch (err) {
         console.error(`❌ ${mode} 再接続処理エラー:`, err.message);
         if (this.is502Error(err)) {
           // 502エラーの場合は再度長期再接続をスケジュール
+          console.log(`❌ ${mode} 502エラー継続 - 次回は900秒後`);
           this.scheduleLongTermReconnect(mode);
         } else {
           // その他のエラーの場合は通常の再接続処理
