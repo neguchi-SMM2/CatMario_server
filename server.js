@@ -565,10 +565,26 @@ if (require.main === module) {
   
   process.on('uncaughtException', (err) => {
     console.error('❌ 未処理の例外:', err);
+    
+    // 502エラーや接続エラーは致命的ではないので継続
+    if (err.message && (
+      err.message.includes("502") || 
+      err.message.includes("Unexpected server response") ||
+      err.message.includes("ECONNREFUSED") ||
+      err.message.includes("ETIMEDOUT")
+    )) {
+      console.warn("⚠️ 非致命的な接続エラーを検出 - サーバー継続");
+      return;
+    }
+    
+    // ポート使用エラーは致命的
     if (err.code === 'EADDRINUSE') {
       console.error(`❌ ポート ${PORT} は既に使用されています`);
       process.exit(1);
     }
+    
+    // その他の致命的エラーも継続を試みる
+    console.warn("⚠️ 例外を記録しましたがサーバーを継続します");
   });
   
   server.start().catch(err => {
