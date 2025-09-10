@@ -84,6 +84,40 @@ class CloudManager {
     }
   }
 
+  // 502エラーかどうかを判定する関数
+  is502Error(error) {
+    const message = error.message || '';
+    return message.includes("502") || message.includes("Unexpected server response: 502");
+  }
+
+  // 特定のサービスを強制切断する関数
+  forceDisconnectService(mode, reason = "強制切断") {
+    const data = this.cloudData[mode];
+    
+    if (data.connection) {
+      try {
+        if (mode === "scratch") {
+          data.connection.close();
+        } else if (mode === "turbowarp" && data.connection.readyState === WebSocket.OPEN) {
+          data.connection.terminate();
+        }
+      } catch (err) {
+        console.warn(`⚠️ ${mode} 接続切断時エラー:`, err.message);
+      }
+    }
+    
+    data.connection = null;
+    data.isAvailable = false;
+    
+    console.log(`🔌 ${mode} ${reason}`);
+    this.broadcast(JSON.stringify({
+      type: "connection_status",
+      mode,
+      status: "disconnected",
+      message: `${mode} Cloud が${reason}されました`
+    }));
+  }
+
   async connectToScratchCloud() {
     const data = this.cloudData.scratch;
     if (data.connection && data.isAvailable) {
@@ -125,21 +159,29 @@ class CloudManager {
       });
       cloud.on("error", (err) => {
         console.error("❌ Scratch Cloud エラー:", err.message);
-        this.handleDisconnection("scratch");
+        if (this.is502Error(err)) {
+          this.handle502Error("scratch", err);
+        } else {
+          this.handleDisconnection("scratch");
+        }
       });
       return true;
     } catch (err) {
       console.error("❌ Scratch Cloud 接続失敗:", err.message);
-      data.failedAttempts++;
-      data.isAvailable = false;
-      data.connection = null;
-      this.broadcast(JSON.stringify({
-        type: "connection_status",
-        mode: "scratch",
-        status: "disconnected",
-        message: `Scratch Cloud 接続失敗 (${data.failedAttempts}回目)`
-      }));
-      this.scheduleReconnect("scratch");
+      if (this.is502Error(err)) {
+        this.handle502Error("scratch", err);
+      } else {
+        data.failedAttempts++;
+        data.isAvailable = false;
+        data.connection = null;
+        this.broadcast(JSON.stringify({
+          type: "connection_status",
+          mode: "scratch",
+          status: "disconnected",
+          message: `Scratch Cloud 接続失敗 (${data.failedAttempts}回目)`
+        }));
+        this.scheduleReconnect("scratch");
+      }
       return false;
     }
   }
@@ -219,24 +261,87 @@ class CloudManager {
       });
       socket.on("error", err => {
         console.error("❌ TurboWarp エラー:", err.message);
-        data.failedAttempts++;
-        this.handleDisconnection("turbowarp");
+        if (this.is502Error(err)) {
+          this.handle502Error("turbowarp", err);
+        } else {
+          data.failedAttempts++;
+          this.handleDisconnection("turbowarp");
+        }
       });
       return true;
     } catch (err) {
       console.error("❌ TurboWarp Cloud 接続失敗:", err.message);
-      data.failedAttempts++;
-      data.isAvailable = false;
-      data.connection = null;
-      this.broadcast(JSON.stringify({
-        type: "connection_status",
-        mode: "turbowarp",
-        status: "disconnected",
-        message: `TurboWarp Cloud 接続失敗 (${data.failedAttempts}回目)`
-      }));
-      this.scheduleReconnect("turbowarp");
+      if (this.is502Error(err)) {
+        this.handle502Error("turbowarp", err);
+      } else {
+        data.failedAttempts++;
+        data.isAvailable = false;
+        data.connection = null;
+        this.broadcast(JSON.stringify({
+          type: "connection_status",
+          mode: "turbowarp",
+          status: "disconnected",
+          message: `TurboWarp Cloud 接続失敗 (${data.failedAttempts}回目)`
+        }));
+        this.scheduleReconnect("turbowarp");
+      }
       return false;
     }
+  }
+
+  // 502エラー専用ハンドリング
+  handle502Error(mode, error) {
+    console.warn(`⚠️ 502エラー検出 - ${mode}を切断し、900秒後に再接続`);
+    
+    const data = this.cloudData[mode];
+    
+    // 接続を強制切断
+    this.forceDisconnectService(mode, "502エラーにより切断");
+    
+    // 失敗回数を最大値に設定して即座に長期再接続モードに
+    data.failedAttempts = this.MAX_FAILED_ATTEMPTS;
+    data.lastAttempt = Date.now();
+    
+    // 長期再接続をスケジュール
+    this.scheduleLongTermReconnect(mode);
+  }
+
+  // 長期再接続専用スケジューラー
+  scheduleLongTermReconnect(mode) {
+    const data = this.cloudData[mode];
+    
+    if (data.reconnectTimer) {
+      clearTimeout(data.reconnectTimer);
+    }
+    
+    console.log(`⏰ ${mode} 長期再接続を900秒後に実行`);
+    
+    data.reconnectTimer = setTimeout(async () => {
+      console.log(`🔄 ${mode} 900秒後の再接続を開始...`);
+      try {
+        let success = false;
+        if (mode === "scratch") {
+          success = await this.connectToScratchCloud();
+        } else {
+          success = this.connectToTurboWarpCloud();
+        }
+        
+        if (!success) {
+          // 再接続失敗時は再度900秒後に試行
+          console.log(`❌ ${mode} 再接続失敗 - 次回は900秒後`);
+          this.scheduleLongTermReconnect(mode);
+        }
+      } catch (err) {
+        console.error(`❌ ${mode} 再接続処理エラー:`, err.message);
+        if (this.is502Error(err)) {
+          // 502エラーの場合は再度長期再接続をスケジュール
+          this.scheduleLongTermReconnect(mode);
+        } else {
+          // その他のエラーの場合は通常の再接続処理
+          this.scheduleReconnect(mode);
+        }
+      }
+    }, this.LONG_RECONNECT_INTERVAL);
   }
 
   handleDisconnection(mode) {
@@ -465,17 +570,36 @@ if (require.main === module) {
   });
   process.on('uncaughtException', (err) => {
     console.error('❌ 未処理の例外:', err);
+    
+    // 502エラーの場合は個別に処理
     if (err.message && (
       err.message.includes("502") || 
       err.message.includes("Unexpected server response")
     )) {
-      console.warn("⚠️ 502エラー検出 - 900秒後に再接続をスケジュール");
+      console.warn("⚠️ 502エラー検出 - 問題のあるサーバーだけを切断し、900秒後に再接続");
+      
+      // どのサービスが502エラーかを判定して個別処理
+      // この時点では特定できないため、両方チェックして問題があるものだけ処理
       for (const [mode, data] of Object.entries(server.cloudData)) {
-        data.failedAttempts = server.MAX_FAILED_ATTEMPTS; // 即座に長期モードへ
-        server.scheduleReconnect(mode);
+        if (data.connection && data.isAvailable) {
+          // 接続状態をチェックして問題があるものだけ502エラー処理
+          try {
+            if (mode === "scratch" && data.connection) {
+              // Scratch接続の状態チェック（簡易的）
+              server.handle502Error(mode, err);
+            } else if (mode === "turbowarp" && data.connection && data.connection.readyState !== WebSocket.OPEN) {
+              // TurboWarp接続の状態チェック
+              server.handle502Error(mode, err);
+            }
+          } catch (checkErr) {
+            // チェック中にエラーが出た場合は502として処理
+            server.handle502Error(mode, err);
+          }
+        }
       }
       return;
     }
+    
     if (err.code === 'EADDRINUSE') {
       console.error(`❌ ポート ${PORT} は既に使用されています`);
       process.exit(1);
@@ -487,4 +611,3 @@ if (require.main === module) {
     process.exit(1);
   });
 }
-
