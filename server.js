@@ -135,38 +135,40 @@ class CloudManager {
     if (this.cloudData.scratch.connection || this.cloudData.scratch.isReconnecting) {
       return;
     }
-
+  
     this.cloudData.scratch.isReconnecting = true;
-    
+  
     try {
       console.log("🔄 Scratch Cloud 接続試行中...");
-      
-      // タイムアウト付きで接続を試行
+  
       const session = await Promise.race([
         Session.createAsync(USERNAME, PASSWORD),
         new Promise((_, reject) => setTimeout(() => reject(new Error('接続タイムアウト')), 15000))
       ]);
-
+  
       const cloud = await Promise.race([
         Cloud.createAsync(session, PROJECT_ID),
         new Promise((_, reject) => setTimeout(() => reject(new Error('クラウド接続タイムアウト')), 15000))
       ]);
-      
+  
       this.cloudData.scratch.connection = cloud;
       this.cloudData.scratch.vars = { ...cloud.vars };
       this.cloudData.scratch.reconnectDelay = 5000; // 再接続遅延をリセット
       console.log("✅ Scratch Cloud 接続成功");
-
+  
       // 🚀 イベントハンドラーをtry-catchで包む
       cloud.on("set", (name, value) => {
         try {
-          this.cloudData.scratch.vars[name] = value;
-          this.scheduleBroadcast("scratch", name, value);
+          const prevValue = this.cloudData.scratch.vars[name];
+          if (prevValue !== value) {  // ✅ 前回と違うときだけ更新
+            this.cloudData.scratch.vars[name] = value;
+            this.scheduleBroadcast("scratch", name, value);
+          }
         } catch (err) {
           console.error("❌ Scratch set イベント処理失敗:", err.message);
         }
       });
-
+  
       cloud.on("close", () => {
         try {
           console.warn("⚠️ Scratch Cloud 接続切断");
@@ -176,7 +178,7 @@ class CloudManager {
           console.error("❌ Scratch close イベント処理失敗:", err.message);
         }
       });
-
+  
       cloud.on("error", (err) => {
         try {
           console.error("❌ Scratch Cloud エラー:", err.message);
@@ -186,17 +188,17 @@ class CloudManager {
           console.error("❌ Scratch error イベントハンドラー失敗:", handlerErr.message);
         }
       });
-
+  
     } catch (err) {
       console.error("❌ Scratch Cloud 接続失敗:", err.message);
       console.log("⚠️ Scratch Cloudなしでサーバーを継続します");
       this.cloudData.scratch.connection = null;
-      
+  
       // 失敗時も再接続をスケジュール
       setTimeout(() => {
         this.scheduleReconnect("scratch");
       }, 5000);
-      
+  
     } finally {
       this.cloudData.scratch.isReconnecting = false;
     }
