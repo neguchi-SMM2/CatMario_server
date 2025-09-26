@@ -19,7 +19,8 @@ class CloudManager {
         isAvailable: false,
         lastAttempt: 0,
         failedAttempts: 0,
-        reconnectTimer: null
+        reconnectTimer: null,
+        isConnecting: false
       },
       turbowarp: { 
         connection: null, 
@@ -28,7 +29,8 @@ class CloudManager {
         isAvailable: false,
         lastAttempt: 0,
         failedAttempts: 0,
-        reconnectTimer: null
+        reconnectTimer: null,
+        isConnecting: false
       }
     };
     
@@ -38,6 +40,7 @@ class CloudManager {
     this.LONG_RECONNECT_INTERVAL = 900000; // 15分
     this.MAX_FAILED_ATTEMPTS = 3;
     this.BATCH_DELAY = 50; // バッチ処理の遅延
+    this.CONNECTION_TIMEOUT = 30000; // 接続タイムアウト
   }
 
   scheduleBroadcast(mode, name, value) {
@@ -95,22 +98,33 @@ class CloudManager {
   isNetworkError(error) {
     const message = error.message || '';
     return message.includes("502") || 
-           message.includes("Unexpected server response: 502") ||
+           message.includes("Unexpected server response") ||
            message.includes("ECONNRESET") ||
            message.includes("ENOTFOUND") ||
-           message.includes("ETIMEDOUT");
+           message.includes("ETIMEDOUT") ||
+           message.includes("callback is not a function") ||
+           message.includes("ECONNREFUSED");
   }
 
   // サービス切断処理
   forceDisconnectService(mode, reason = "強制切断") {
     const data = this.cloudData[mode];
     
+    // 接続中フラグをリセット
+    data.isConnecting = false;
+    
     if (data.connection) {
       try {
         if (mode === "scratch") {
-          data.connection.close();
-        } else if (mode === "turbowarp" && data.connection.readyState === WebSocket.OPEN) {
-          data.connection.terminate();
+          // scratchcloudライブラリのcloseメソッドを安全に呼び出し
+          if (typeof data.connection.close === 'function') {
+            data.connection.close();
+          }
+        } else if (mode === "turbowarp") {
+          if (data.connection.readyState === WebSocket.OPEN || 
+              data.connection.readyState === WebSocket.CONNECTING) {
+            data.connection.terminate();
+          }
         }
       } catch (err) {
         console.warn(`⚠️ ${mode} 接続切断時エラー:`, err.message);
@@ -134,9 +148,15 @@ class CloudManager {
     const data = this.cloudData.scratch;
     
     // 既に接続済みの場合
-    if (data.connection && data.isAvailable) {
+    if (data.connection && data.isAvailable && !data.isConnecting) {
       console.log("✅ Scratch Cloud は既に接続済み");
       return true;
+    }
+
+    // 接続中の場合は待機
+    if (data.isConnecting) {
+      console.log("🔄 Scratch Cloud 接続中のため待機");
+      return false;
     }
 
     // 連続失敗による長期待機中の場合
@@ -149,18 +169,50 @@ class CloudManager {
       }
     }
 
+    data.isConnecting = true;
+    const connectionTimeout = setTimeout(() => {
+      if (data.isConnecting) {
+        console.warn("⚠️ Scratch Cloud 接続タイムアウト");
+        this.handleError("scratch", new Error("Connection timeout"));
+      }
+    }, this.CONNECTION_TIMEOUT);
+
     try {
       console.log("🔄 Scratch Cloud 接続試行中...");
       data.lastAttempt = Date.now();
       
-      const session = await Session.createAsync(USERNAME, PASSWORD);
-      const cloud = await Cloud.createAsync(session, PROJECT_ID);
+      // セッション作成を安全に実行
+      let session, cloud;
+      try {
+        session = await Promise.race([
+          Session.createAsync(USERNAME, PASSWORD),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Session creation timeout")), 15000)
+          )
+        ]);
+      } catch (sessionErr) {
+        throw new Error(`Session creation failed: ${sessionErr.message}`);
+      }
+
+      try {
+        cloud = await Promise.race([
+          Cloud.createAsync(session, PROJECT_ID),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Cloud creation timeout")), 15000)
+          )
+        ]);
+      } catch (cloudErr) {
+        throw new Error(`Cloud creation failed: ${cloudErr.message}`);
+      }
+
+      clearTimeout(connectionTimeout);
       
       data.connection = cloud;
       data.vars = { ...cloud.vars };
       data.isAvailable = true;
       data.failedAttempts = 0;
       data.reconnectDelay = 5000; // 初期値にリセット
+      data.isConnecting = false;
       
       console.log("✅ Scratch Cloud 接続成功");
       this.broadcast(JSON.stringify({
@@ -171,25 +223,35 @@ class CloudManager {
         timestamp: new Date().toISOString()
       }));
 
-      // イベントハンドラー設定
-      cloud.on("set", (name, value) => {
-        data.vars[name] = value;
-        this.scheduleBroadcast("scratch", name, value);
-      });
+      // イベントハンドラー設定（エラーハンドリングを強化）
+      try {
+        cloud.on("set", (name, value) => {
+          try {
+            data.vars[name] = value;
+            this.scheduleBroadcast("scratch", name, value);
+          } catch (err) {
+            console.warn("⚠️ Scratch set イベント処理エラー:", err.message);
+          }
+        });
 
-      cloud.on("close", () => {
-        console.warn("⚠️ Scratch Cloud 接続切断");
-        this.handleDisconnection("scratch");
-      });
+        cloud.on("close", () => {
+          console.warn("⚠️ Scratch Cloud 接続切断");
+          this.handleDisconnection("scratch");
+        });
 
-      cloud.on("error", (err) => {
-        console.error("❌ Scratch Cloud エラー:", err.message);
-        this.handleError("scratch", err);
-      });
+        cloud.on("error", (err) => {
+          console.error("❌ Scratch Cloud エラー:", err.message);
+          this.handleError("scratch", err);
+        });
+      } catch (err) {
+        console.warn("⚠️ Scratch イベントハンドラー設定エラー:", err.message);
+      }
 
       return true;
 
     } catch (err) {
+      clearTimeout(connectionTimeout);
+      data.isConnecting = false;
       console.error("❌ Scratch Cloud 接続失敗:", err.message);
       this.handleError("scratch", err);
       return false;
@@ -200,9 +262,15 @@ class CloudManager {
     const data = this.cloudData.turbowarp;
     
     // 既に接続済みの場合
-    if (data.connection?.readyState === WebSocket.OPEN && data.isAvailable) {
+    if (data.connection?.readyState === WebSocket.OPEN && data.isAvailable && !data.isConnecting) {
       console.log("✅ TurboWarp Cloud は既に接続済み");
       return true;
+    }
+
+    // 接続中の場合は待機
+    if (data.isConnecting) {
+      console.log("🔄 TurboWarp Cloud 接続中のため待機");
+      return false;
     }
 
     // 連続失敗による長期待機中の場合
@@ -215,6 +283,14 @@ class CloudManager {
       }
     }
 
+    data.isConnecting = true;
+    const connectionTimeout = setTimeout(() => {
+      if (data.isConnecting) {
+        console.warn("⚠️ TurboWarp Cloud 接続タイムアウト");
+        this.handleError("turbowarp", new Error("Connection timeout"));
+      }
+    }, this.CONNECTION_TIMEOUT);
+
     try {
       console.log("🔄 TurboWarp Cloud 接続試行中...");
       data.lastAttempt = Date.now();
@@ -222,33 +298,47 @@ class CloudManager {
       const socket = new WebSocket("wss://clouddata.turbowarp.org", {
         headers: {
           "User-Agent": "CatMario_server/1.0 (https://github.com/neguchi-SMM2/CatMario_server)"
-        }
+        },
+        handshakeTimeout: 10000,
+        perMessageDeflate: false
       });
 
       socket.on("open", () => {
-        socket.send(JSON.stringify({
-          method: "handshake",
-          user: "server-bot",
-          project_id: PROJECT_ID
-        }));
-        
-        data.connection = socket;
-        data.isAvailable = true;
-        data.failedAttempts = 0;
-        data.reconnectDelay = 2000; // 初期値にリセット
-        
-        console.log("✅ TurboWarp Cloud 接続成功");
-        this.broadcast(JSON.stringify({
-          type: "connection_status",
-          mode: "turbowarp",
-          status: "connected",
-          message: "TurboWarp Cloud に接続しました",
-          timestamp: new Date().toISOString()
-        }));
+        try {
+          clearTimeout(connectionTimeout);
+          
+          socket.send(JSON.stringify({
+            method: "handshake",
+            user: "server-bot",
+            project_id: PROJECT_ID
+          }));
+          
+          data.connection = socket;
+          data.isAvailable = true;
+          data.failedAttempts = 0;
+          data.reconnectDelay = 2000; // 初期値にリセット
+          data.isConnecting = false;
+          
+          console.log("✅ TurboWarp Cloud 接続成功");
+          this.broadcast(JSON.stringify({
+            type: "connection_status",
+            mode: "turbowarp",
+            status: "connected",
+            message: "TurboWarp Cloud に接続しました",
+            timestamp: new Date().toISOString()
+          }));
+        } catch (err) {
+          console.error("❌ TurboWarp open handler エラー:", err.message);
+          this.handleError("turbowarp", err);
+        }
       });
 
       socket.on("message", msg => {
-        this.handleTurboWarpMessage(msg);
+        try {
+          this.handleTurboWarpMessage(msg);
+        } catch (err) {
+          console.warn("⚠️ TurboWarp message handler エラー:", err.message);
+        }
       });
 
       socket.on("close", (code, reason) => {
@@ -257,6 +347,8 @@ class CloudManager {
       });
 
       socket.on("error", err => {
+        clearTimeout(connectionTimeout);
+        data.isConnecting = false;
         console.error("❌ TurboWarp エラー:", err.message);
         this.handleError("turbowarp", err);
       });
@@ -264,6 +356,8 @@ class CloudManager {
       return true;
 
     } catch (err) {
+      clearTimeout(connectionTimeout);
+      data.isConnecting = false;
       console.error("❌ TurboWarp Cloud 接続失敗:", err.message);
       this.handleError("turbowarp", err);
       return false;
@@ -306,9 +400,10 @@ class CloudManager {
   // エラー処理の統一
   handleError(mode, error) {
     const data = this.cloudData[mode];
+    data.isConnecting = false; // 接続中フラグをリセット
 
     if (this.isNetworkError(error)) {
-      console.warn(`⚠️ ネットワークエラー検出 - ${mode}を切断し、長期再接続モードへ`);
+      console.warn(`⚠️ ネットワークエラー検出 (${mode}): ${error.message}`);
       this.forceDisconnectService(mode, "ネットワークエラーにより切断");
       data.failedAttempts = this.MAX_FAILED_ATTEMPTS;
       data.lastAttempt = Date.now();
@@ -322,7 +417,7 @@ class CloudManager {
         type: "connection_status",
         mode,
         status: "disconnected",
-        message: `${mode} Cloud 接続失敗 (${data.failedAttempts}回目)`,
+        message: `${mode} Cloud 接続失敗 (${data.failedAttempts}回目): ${error.message}`,
         timestamp: new Date().toISOString()
       }));
 
@@ -370,6 +465,7 @@ class CloudManager {
     const data = this.cloudData[mode];
     data.connection = null;
     data.isAvailable = false;
+    data.isConnecting = false;
     
     this.broadcast(JSON.stringify({
       type: "connection_status",
@@ -423,26 +519,36 @@ class CloudManager {
     const data = this.cloudData[mode];
     const strValue = String(value);
     
-    if (!data.isAvailable || !data.connection) {
+    if (!data.isAvailable || !data.connection || data.isConnecting) {
       throw new Error(`${mode} Cloud は利用できません`);
     }
 
-    if (mode === "scratch") {
-      await data.connection.set(name, strValue);
-    } else if (mode === "turbowarp") {
-      const socket = data.connection;
-      if (socket.readyState !== WebSocket.OPEN) {
-        throw new Error("TurboWarp Cloud 接続が無効です");
+    try {
+      if (mode === "scratch") {
+        if (typeof data.connection.set === 'function') {
+          await data.connection.set(name, strValue);
+        } else {
+          throw new Error("Scratch connection set method not available");
+        }
+      } else if (mode === "turbowarp") {
+        const socket = data.connection;
+        if (socket.readyState !== WebSocket.OPEN) {
+          throw new Error("TurboWarp Cloud 接続が無効です");
+        }
+        socket.send(JSON.stringify({
+          method: "set",
+          name,
+          value: strValue,
+          user: "server-bot",
+          project_id: PROJECT_ID
+        }));
+      } else {
+        throw new Error(`無効なmode: ${mode}`);
       }
-      socket.send(JSON.stringify({
-        method: "set",
-        name,
-        value: strValue,
-        user: "server-bot",
-        project_id: PROJECT_ID
-      }));
-    } else {
-      throw new Error(`無効なmode: ${mode}`);
+    } catch (err) {
+      console.error(`❌ ${mode} 変数設定エラー:`, err.message);
+      this.handleError(mode, err);
+      throw err;
     }
   }
 
@@ -482,24 +588,32 @@ class CloudManager {
     // 現在のクラウド変数状態を送信
     for (const [mode, data] of Object.entries(this.cloudData)) {
       if (data.isAvailable) {
-        ws.send(JSON.stringify({
-          type: "all",
-          mode,
-          vars: data.vars,
-          timestamp: new Date().toISOString()
-        }));
+        try {
+          ws.send(JSON.stringify({
+            type: "all",
+            mode,
+            vars: data.vars,
+            timestamp: new Date().toISOString()
+          }));
+        } catch (err) {
+          console.warn("⚠️ 初期データ送信失敗:", err.message);
+        }
       }
     }
 
     // サービス状態を送信
-    ws.send(JSON.stringify({
-      type: "service_status",
-      services: {
-        scratch: this.cloudData.scratch.isAvailable,
-        turbowarp: this.cloudData.turbowarp.isAvailable
-      },
-      timestamp: new Date().toISOString()
-    }));
+    try {
+      ws.send(JSON.stringify({
+        type: "service_status",
+        services: {
+          scratch: this.cloudData.scratch.isAvailable,
+          turbowarp: this.cloudData.turbowarp.isAvailable
+        },
+        timestamp: new Date().toISOString()
+      }));
+    } catch (err) {
+      console.warn("⚠️ サービス状態送信失敗:", err.message);
+    }
 
     ws.on("message", async msg => {
       try {
@@ -561,7 +675,11 @@ class CloudManager {
         }
       } catch (err) {
         console.error("⚠️ メッセージ処理エラー:", err);
-        ws.send(CloudManager.responses.parseError);
+        try {
+          ws.send(CloudManager.responses.parseError);
+        } catch (sendErr) {
+          console.error("⚠️ エラーレスポンス送信失敗:", sendErr.message);
+        }
       }
     });
 
@@ -578,6 +696,13 @@ class CloudManager {
 
   async start() {
     console.log("🚀 サーバー起動中...");
+
+    // 環境変数チェック
+    if (!USERNAME || !PASSWORD || !PROJECT_ID) {
+      console.error("❌ 必要な環境変数が設定されていません:");
+      console.error("   SCRATCH_USERNAME, SCRATCH_PASSWORD, SCRATCH_PROJECT_ID");
+      process.exit(1);
+    }
 
     // WebSocketサーバー設定
     this.wss.on("connection", ws => this.handleConnection(ws));
@@ -640,6 +765,7 @@ class CloudManager {
         clearTimeout(data.reconnectTimer);
         data.reconnectTimer = null;
       }
+      data.isConnecting = false;
     }
 
     if (this.batchTimeout) {
@@ -648,15 +774,29 @@ class CloudManager {
     }
 
     // クライアントにシャットダウン通知
-    this.broadcast(JSON.stringify({ 
-      type: "server_shutdown", 
-      message: "サーバーがシャットダウンします",
-      timestamp: new Date().toISOString()
-    }));
+    try {
+      this.broadcast(JSON.stringify({ 
+        type: "server_shutdown", 
+        message: "サーバーがシャットダウンします",
+        timestamp: new Date().toISOString()
+      }));
+    } catch (err) {
+      console.warn("⚠️ シャットダウン通知送信失敗:", err.message);
+    }
 
     // 接続クローズ
-    this.cloudData.scratch.connection?.close();
-    this.cloudData.turbowarp.connection?.close();
+    try {
+      this.cloudData.scratch.connection?.close();
+    } catch (err) {
+      console.warn("⚠️ Scratch接続クローズ時エラー:", err.message);
+    }
+
+    try {
+      this.cloudData.turbowarp.connection?.close();
+    } catch (err) {
+      console.warn("⚠️ TurboWarp接続クローズ時エラー:", err.message);
+    }
+
     this.wss.close();
 
     console.log("✅ シャットダウン完了");
@@ -671,10 +811,27 @@ if (require.main === module) {
   // エラーハンドリング
   process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ 未処理のPromise拒否:', reason);
+    
+    // Scratch Cloudライブラリ関連のエラーを個別処理
+    if (reason && reason.message) {
+      const message = reason.message;
+      if (message.includes("callback is not a function") || 
+          message.includes("Unexpected server response")) {
+        console.warn("⚠️ Scratch Cloudライブラリエラー検出 - 長期再接続モードへ");
+        
+        // Scratchサービスを長期再接続モードに移行
+        const scratchData = server.cloudData.scratch;
+        server.forceDisconnectService("scratch", "ライブラリエラーにより切断");
+        scratchData.failedAttempts = server.MAX_FAILED_ATTEMPTS;
+        scratchData.lastAttempt = Date.now();
+        server.scheduleLongTermReconnect("scratch");
+      }
+    }
   });
 
   process.on('uncaughtException', (err) => {
-    console.error('❌ 未処理の例外:', err);
+    console.error('❌ 未処理の例外:', err.message);
+    console.error('スタックトレース:', err.stack);
 
     // ポート使用エラー
     if (err.code === 'EADDRINUSE') {
@@ -682,31 +839,48 @@ if (require.main === module) {
       process.exit(1);
     }
 
+    // Scratch Cloudライブラリ関連のエラー
+    if (err.message && (
+      err.message.includes("callback is not a function") ||
+      err.message.includes("Unexpected server response") ||
+      err.message.includes("502")
+    )) {
+      console.warn("⚠️ Scratch Cloudライブラリエラー検出");
+      
+      try {
+        const scratchData = server.cloudData.scratch;
+        if (scratchData.isConnecting || scratchData.isAvailable) {
+          server.forceDisconnectService("scratch", "ライブラリエラーにより切断");
+          scratchData.failedAttempts = server.MAX_FAILED_ATTEMPTS;
+          scratchData.lastAttempt = Date.now();
+          server.scheduleLongTermReconnect("scratch");
+        }
+      } catch (handlingErr) {
+        console.error("⚠️ エラー処理中に例外:", handlingErr.message);
+      }
+      return; // プロセス終了を回避
+    }
+
     // ネットワークエラーの場合は個別処理
     if (err.message && (
-      err.message.includes("502") || 
-      err.message.includes("Unexpected server response") ||
       err.message.includes("ECONNRESET") ||
-      err.message.includes("ETIMEDOUT")
+      err.message.includes("ETIMEDOUT") ||
+      err.message.includes("ENOTFOUND") ||
+      err.message.includes("ECONNREFUSED")
     )) {
       console.warn("⚠️ ネットワークエラー検出 - 問題のあるサービスを長期再接続モードに移行");
       
-      // 各サービスの状態をチェックして問題があるものを処理
-      for (const [mode, data] of Object.entries(server.cloudData)) {
-        if (data.connection && data.isAvailable) {
-          try {
-            // 接続状態の簡易チェック
-            if ((mode === "scratch" && !data.connection) || 
-                (mode === "turbowarp" && data.connection.readyState !== WebSocket.OPEN)) {
-              server.handleError(mode, err);
-            }
-          } catch (checkErr) {
-            // チェック中にエラーが出た場合もネットワークエラーとして処理
+      try {
+        // 各サービスの状態をチェックして問題があるものを処理
+        for (const [mode, data] of Object.entries(server.cloudData)) {
+          if (data.connection || data.isConnecting) {
             server.handleError(mode, err);
           }
         }
+      } catch (handlingErr) {
+        console.error("⚠️ ネットワークエラー処理中に例外:", handlingErr.message);
       }
-      return;
+      return; // プロセス終了を回避
     }
 
     console.warn("⚠️ 例外を記録しましたがサーバーを継続します");
@@ -715,6 +889,14 @@ if (require.main === module) {
   // サーバー起動
   server.start().catch(err => {
     console.error("❌ サーバー起動失敗:", err);
+    
+    // 起動失敗の詳細ログ
+    if (err.message.includes("EADDRINUSE")) {
+      console.error(`💡 解決方法: ポート ${PORT} を使用している他のプロセスを停止するか、別のポートを指定してください`);
+    } else if (err.message.includes("EACCES")) {
+      console.error("💡 解決方法: ポートへのアクセス権限を確認してください");
+    }
+    
     process.exit(1);
   });
 }
